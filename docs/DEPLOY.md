@@ -1,6 +1,6 @@
 # Deploy na KingHost
 
-> **Situação (16/11/2026):** pipeline configurado e testado localmente, à espera do primeiro deploy em **https://oranilom.com.br/sampa-tech/**. Hoje o endereço responde **403**, porque a pasta `sampa-tech` já existe no servidor, provavelmente criada pelo Git Webhook (ver [Pendências](#pendências)). Esta linha será atualizada depois do primeiro deploy conferido.
+> **Situação (16/11/2026):** em produção em **https://oranilom.com.br/sampa-tech/**, publicado e conferido pelo próprio pipeline (execução "Merge pull request #1": `PHP 8.1`, `PHP 8.3` e `Deploy KingHost (FTPS)` verdes). Verificação manual no mesmo dia: a página, o CSS, as fontes e os logos respondem 200 a partir de `/sampa-tech/assets/…` (o `.htaccess` da raiz está ativo); o botão do Aceleração Vai Tec redireciona (302) para `https://adesampa.com.br/vaitec/`; `app/`, as configurações e `.htaccess` respondem 403; `docs/`, `tests/`, `bin/`, `.git` e `.ftp-deploy-sync-state.json` respondem 404; o 404 personalizado está ativo; os cabeçalhos CSP, HSTS e X-Frame-Options estão presentes. O ruleset do `main` está ativo.
 
 O site não precisa de banco, instalação, diretório de dados, extensões PHP extras nem tarefas agendadas. Publicar é só copiar arquivos.
 
@@ -164,9 +164,9 @@ O deploy por GitHub Actions + FTPS resolve os três pontos e mostra erros claros
 
 ## Pendências
 
-- [ ] Cadastrar os segredos `FTP_USERNAME` e `FTP_PASSWORD` (aba *Secrets*).
-- [ ] Criar o ruleset do `main` (Active, bypass vazio, checks `PHP 8.1` e `PHP 8.3`).
-- [ ] Se houver um Git Webhook para `sampa-tech`: removê-lo no painel da KingHost e em *GitHub → Settings → Webhooks*.
-- [ ] Pasta `www/sampa-tech` (hoje responde 403): se tiver sido criada pelo webhook, apagá-la pelo gerenciador de arquivos do painel e criar `sampa-tech/app` e `sampa-tech/public`.
-- [ ] Primeiro deploy e verificação manual (ver [Checklist](#checklist-de-conferência)).
+- [x] Segredos `FTP_USERNAME` e `FTP_PASSWORD` cadastrados (aba *Secrets*).
+- [x] Ruleset do `main` ativo (bypass vazio, PR obrigatório, checks `PHP 8.1` e `PHP 8.3`, sem force push nem exclusão).
+- [x] Pasta `www/sampa-tech`: acessível pelo FTP, com `app/` e `public/` e com o `.htaccess` aplicado. Não precisou ser recriada.
+- [x] Primeiro deploy e verificação manual (ver [Checklist](#checklist-de-conferência)).
+- [ ] Conferir no painel da KingHost (*Git Webhook*) se não há integração apontando para `sampa-tech` e removê-la, se houver.
 - [ ] Textos definitivos da página (ver [PENDENCIAS.md](PENDENCIAS.md)).
