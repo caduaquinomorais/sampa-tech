@@ -1,0 +1,256 @@
+# Testes e deploy do Sampa Tech.
+#
+# - Pull Request: roda os testes. Com o ruleset do main ativo, o PR só pode ser mesclado
+#   se os checks "PHP 8.1" e "PHP 8.3" passarem.
+# - Push no main (merge de PR) ou execução manual (aba Actions → "Run workflow"):
+#   roda os testes e, se passarem, publica por FTPS na KingHost (pasta ./sampa-tech/ dentro
+#   de www) e confere se o site responde com o CSS e o botão do Aceleração Vai Tec.
+#   Detalhes e diagnóstico: docs/DEPLOY.md.
+#
+# Segredos necessários (Settings → Secrets and variables → Actions → aba "Secrets"):
+#   FTP_USERNAME  usuário de FTP da KingHost
+#   FTP_PASSWORD  senha de FTP da KingHost (NUNCA na aba "Variables": lá fica visível)
+# Variáveis opcionais (mesma tela, aba "Variables"); normalmente não devem existir:
+#   FTP_SERVER    padrão web1160.kinghost.net (ftp.oranilom.com.br é apelido dele, mas o
+#                 certificado TLS da KingHost só vale para *.kinghost.net)
+#   FTP_DIR       padrão: descoberta automática (encontra ./sampa-tech/)
+#   FTP_PROTOCOL  padrão ftps (criptografado). Não usar ftp.
+
+name: Testes
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testes-${{ github.ref }}
+  # Em PR, um push novo cancela o anterior. No main, nunca interrompe uma execução pela metade.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  testes:
+    # Estes nomes ("PHP 8.1" e "PHP 8.3") são os checks obrigatórios do ruleset do main.
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 8.1 = versão mínima exigida; 8.3 = versão recomendada no servidor.
+        php: ['8.1', '8.3']
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar o PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, curl, openssl
+          ini-values: zend.assertions=1, date.timezone=America/Sao_Paulo
+          coverage: none
+
+      - name: Verificar sintaxe de todos os arquivos PHP
+        run: |
+          find . -name '*.php' -not -path './.git/*' -print0 \
+            | xargs -0 -n1 php -l > /dev/null
+
+      - name: Rodar os testes (unitários e HTTP)
+        run: php tests/run.php
+
+  deploy:
+    name: Deploy KingHost (FTPS)
+    needs: testes
+    # Só publica a partir do main, e nunca a partir de Pull Request.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: producao
+      url: https://oranilom.com.br/sampa-tech/
+    concurrency:
+      group: deploy-producao
+      cancel-in-progress: false
+
+    env:
+      FTP_SERVER: ${{ vars.FTP_SERVER || 'web1160.kinghost.net' }}
+      # Vazio = descobrir sozinho (ver "Localizar a pasta do site no FTP").
+      FTP_DIR: ${{ vars.FTP_DIR }}
+      FTP_PROTOCOL: ${{ vars.FTP_PROTOCOL || 'ftps' }}
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      # O servidor FTP da KingHost envia só o próprio certificado, sem o intermediário da
+      # GlobalSign. O Windows busca o intermediário sozinho, mas o OpenSSL/Node do Linux não, e
+      # recusa a conexão ("unable to get local issuer certificate"). Aqui o intermediário é
+      # baixado do endereço oficial indicado no próprio certificado (AIA), e a cadeia é validada
+      # contra as autoridades padrão do sistema. A verificação TLS continua ligada.
+      - name: Completar a cadeia do certificado FTPS
+        if: env.FTP_PROTOCOL == 'ftps'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          echo | timeout 30 openssl s_client -connect "$FTP_SERVER:21" -starttls ftp -servername "$FTP_SERVER" 2>/dev/null \
+            | openssl x509 -out ftp-servidor.pem
+          aia=$(openssl x509 -in ftp-servidor.pem -noout -ext authorityInfoAccess \
+            | grep -oE 'CA Issuers - URI:[^ ]+' | head -1 | sed 's/CA Issuers - URI://')
+          echo "Certificado: $(openssl x509 -in ftp-servidor.pem -noout -subject)"
+          echo "Intermediário: $aia"
+          test -n "$aia"
+          curl -sSf --max-time 30 -o ftp-intermediario.crt "$aia"
+          openssl x509 -inform DER -in ftp-intermediario.crt -out ftp-intermediario.pem 2>/dev/null \
+            || openssl x509 -in ftp-intermediario.crt -out ftp-intermediario.pem
+          openssl verify -untrusted ftp-intermediario.pem ftp-servidor.pem
+          cat /etc/ssl/certs/ca-certificates.crt ftp-intermediario.pem > ftp-ca.pem
+          echo "FTP_CA_BUNDLE=$RUNNER_TEMP/ftp-ca.pem" >> "$GITHUB_ENV"
+          echo "NODE_EXTRA_CA_CERTS=$RUNNER_TEMP/ftp-intermediario.pem" >> "$GITHUB_ENV"
+
+      # Descobre a pasta do site no FTP. Testa FTP_DIR (se existir) e depois os caminhos usuais,
+      # e só aceita uma pasta que já tenha app/ e public/ (a assinatura deste projeto), mesmo
+      # com FTP_DIR definida. O diagnóstico sai como anotação (::notice::/::error::), visível no
+      # resumo da execução e legível pela API pública (check-runs/<id>/annotations).
+      - name: Localizar a pasta do site no FTP
+        id: destino
+        env:
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          set -uo pipefail
+          anota() { local m; m=$(printf '%s' "$2" | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g'); echo "::$1::$m"; }
+          if [ -z "$FTP_USERNAME" ] || [ -z "$FTP_PASSWORD" ]; then
+            anota error "Cadastre os segredos FTP_USERNAME e FTP_PASSWORD em Settings → Secrets and variables → Actions (aba Secrets)."
+            exit 1
+          fi
+          # A senha vai num arquivo netrc legível só por este usuário, nunca na linha de comando.
+          umask 077
+          netrc="$RUNNER_TEMP/netrc"
+          printf 'machine %s login %s password %s\n' "$FTP_SERVER" "$FTP_USERNAME" "$FTP_PASSWORD" > "$netrc"
+          trap 'rm -f "$netrc"' EXIT
+          tls=(); [ "$FTP_PROTOCOL" = ftps ] && tls=(--ssl-reqd --cacert "$FTP_CA_BUNDLE")
+          # Lista nomes com LIST (inclui pastas; NLST em alguns servidores omite pastas).
+          nomes() {
+            local out
+            out=$(curl -sS "${tls[@]}" --netrc-file "$netrc" --max-time 60 "ftp://$FTP_SERVER$1" 2>"$RUNNER_TEMP/ftp-erro") || return 1
+            printf '%s\n' "$out" | awk '{ for (i = 1; i <= 8; i++) $i = ""; sub(/^ +/, ""); print }' | grep -vxE '\.{1,2}|' || true
+          }
+          umalinha() { printf '%s' "$1" | tr '\n' ' '; }
+
+          if ! raiz=$(nomes /); then
+            anota error "Falha ao entrar no FTP $FTP_SERVER: $(cat "$RUNNER_TEMP/ftp-erro"). Erro 67/530 = usuário ou senha incorretos (depois de uma falha, a KingHost bloqueia o IP por alguns minutos)."
+            exit 1
+          fi
+          anota notice "Login OK em $FTP_SERVER. Raiz do FTP: $(umalinha "$raiz")"
+
+          # FTP_DIR (se existir) é testada primeiro; depois, os caminhos usuais.
+          candidatos="${FTP_DIR:-} /sampa-tech/ /www/sampa-tech/ /public_html/sampa-tech/ /"
+          relatorio=""
+          for dir in $candidatos; do
+            # Normaliza: "./www/sampa-tech" → "/www/sampa-tech/". Sem isso a URL vira "host./…",
+            # o login vira anônimo (530) e a KingHost bloqueia o IP por alguns minutos.
+            dir="${dir#.}"
+            case "$dir" in /*) ;; *) dir="/$dir" ;; esac
+            case "$dir" in */) ;; *) dir="$dir/" ;; esac
+            if conteudo=$(nomes "$dir"); then
+              relatorio+="$dir: $(umalinha "$conteudo")"$'\n'
+              if echo "$conteudo" | grep -qx app && echo "$conteudo" | grep -qx public; then
+                anota notice "Pasta de destino: .$dir (relativa à pasta onde o FTP abre)"
+                echo "dir=$dir" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              relatorio+="$dir: não abre ($(tr -d '\n' < "$RUNNER_TEMP/ftp-erro"))"$'\n'
+            fi
+          done
+          anota error "Nenhuma pasta com app/ e public/ do Sampa Tech encontrada. Por segurança, o deploy só publica numa pasta que já tenha as duas (crie sampa-tech/app e sampa-tech/public pelo FTP ou pelo painel). Tentativas:
+          $relatorio"
+          exit 1
+
+      # A KingHost limita conexões seguidas do mesmo IP. Pausa antes do envio e, se a conexão
+      # falhar, uma segunda tentativa depois de 1 minuto.
+      - name: Pausa antes do envio
+        run: sleep 20
+
+      - name: Enviar para a KingHost por FTPS
+        id: envio1
+        continue-on-error: true
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ env.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          # Relativo ("./sampa-tech/"): o FTP da KingHost abre dentro de www, que não é a raiz "/".
+          # Com "/sampa-tech/" absoluto, a action diz que deu certo, mas grava fora de www.
+          server-dir: .${{ steps.destino.outputs.dir }}
+          protocol: ${{ env.FTP_PROTOCOL }}
+          # Envia só o que o site usa. Arquivos removidos do repositório também são
+          # removidos do servidor (apenas os que este deploy enviou).
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            bin/**
+            docs/**
+            tests/**
+            *.md
+            **/*.md
+            .gitattributes
+            .gitignore
+
+      - name: Aguardar antes da segunda tentativa
+        if: steps.envio1.outcome == 'failure'
+        run: sleep 60
+
+      - name: Enviar para a KingHost por FTPS (2ª tentativa)
+        if: steps.envio1.outcome == 'failure'
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ env.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          server-dir: .${{ steps.destino.outputs.dir }}
+          protocol: ${{ env.FTP_PROTOCOL }}
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            bin/**
+            docs/**
+            tests/**
+            *.md
+            **/*.md
+            .gitattributes
+            .gitignore
+
+      - name: Conferir o site publicado
+        run: |
+          set -euo pipefail
+          site='https://oranilom.com.br'
+          url="$site/sampa-tech/"
+          sleep 5
+          status=$(curl -s --retry 3 --retry-delay 5 -o pagina.html -w '%{http_code}' "$url")
+          echo "GET $url → $status"
+          test "$status" = 200
+
+          css=$(grep -oE 'href="[^"]*site\.css[^"]*"' pagina.html | head -1 | sed -E 's/href="([^"]+)"/\1/')
+          test -n "$css"
+          status=$(curl -s -o /dev/null -w '%{http_code}' "$site$css")
+          echo "CSS $css → $status"
+          test "$status" = 200
+
+          botao=$(grep -oE '<a [^>]*data-cta="aceleracao-vai-tec"[^>]*>' pagina.html | head -1)
+          echo "Botão Vai Tec: $botao"
+          grep -q 'Aceleração Vai Tec' pagina.html
+          link=$(printf '%s' "$botao" | grep -oE 'href="[^"]+"' | sed -E 's/href="([^"]+)"/\1/')
+          test -n "$link"
+          destino=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$site$link")
+          echo "GET $link → $destino"
+          case "$destino" in "302 https://"*) ;; *) echo "::error::O botão do Aceleração Vai Tec não redireciona para um endereço https."; exit 1 ;; esac
+          echo "Site no ar com CSS e botão do Aceleração Vai Tec."
