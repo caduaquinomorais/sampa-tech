@@ -1,0 +1,16 @@
+# Configuração local do servidor (nunca versionar)
+/app/config/*.local.php
+
+# Logs, sessões, temporários
+*.log
+/tmp/
+
+# Testes (relatórios gerados)
+/tests/.tmp/
+
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
